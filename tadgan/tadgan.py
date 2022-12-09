@@ -1,12 +1,10 @@
 import os
-import statistics
 import torch
-import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
 from abc import ABCMeta, abstractmethod
 from scipy import stats
-
+from typing import Optional
 
 def set_seed(seed=1):
     torch.manual_seed(seed)
@@ -165,7 +163,8 @@ class TadGanError(Exception):
 
 
 class TadGAN:
-    def __init__(self, dataset: ProcessedDataset,
+    def __init__(self, dataset: Optional[ProcessedDataset]=None,
+                 model_path: Optional[str]=None,
                  batch_size=64,
                  lr=0.0005,
                  num_critics=5,
@@ -176,34 +175,66 @@ class TadGAN:
                  decoder_hidden_size=64,
                  cx_cnn_blocks=4):
         self.dataset = dataset
-        self.window_size = dataset.window_size
-        self.state_size = dataset.state_size
-        self.step_size = int(dataset[1][0] - dataset[0]
-                             [0])
-        if self.step_size < 1:
+        model = torch.load(model_path) if model_path is not None else None
+        if self.dataset is None and model is None:
+            raise TadGanError('invalid: need either dataset or model_path.')
+
+        window_size = model['window_size'] if model else dataset.window_size
+        state_size = model['state_size'] if model else dataset.state_size
+        step_size = model['step_size'] if model else int(dataset[1][0] - dataset[0][0])
+
+        if dataset is not None and window_size != dataset.window_size:
+            raise TadGanError('invalid: window size of dataset')
+        if dataset is not None and state_size != dataset.state_size:
+            raise TadGanError('invalid: state size of dataset')
+        if step_size < 1:
             raise TadGanError('invalid: step size of dataset')
 
-        self.batch_size = batch_size
-        self.lr = lr
-        self.num_epoch = 0
-        self.num_critics = num_critics
-        self.latent_dim = latent_dim
-        self.loss_rate_critics = loss_rate_critics
-        self.loss_rate_generator = loss_rate_generator
+        self.window_size = window_size
+        self.state_size = state_size
+        self.step_size = step_size
 
-        window_size = dataset.window_size
+        self.batch_size = model['batch_size'] if model else batch_size
+        self.num_epoch = model['num_epoch'] if model else 0
+        self.lr = model['lr'] if model else lr
+        self.num_critics = model['num_critics'] if model else num_critics
+        self.latent_dim = model['latent_dim'] if model else latent_dim
+        self.loss_rate_critics = model['loss_rate_critics'] if model else loss_rate_critics
+        self.loss_rate_generator = model['loss_rate_generator'] if model else loss_rate_generator
+
         self.device = torch.device(
             'cuda:0' if torch.cuda.is_available() else 'cpu')
-        self.encoder = Encoder(window_size, latent_dim, hidden_size=encoder_hidden_size).to(self.device)
-        self.decoder = Decoder(window_size, latent_dim, hidden_size=decoder_hidden_size).to(self.device)
-        self.cx = Cx(window_size, state_dim=self.state_size, cnn_blocks=cx_cnn_blocks).to(self.device)
-        self.cz = Cz(latent_dim).to(self.device)
+
+        self.encoder = Encoder(self.window_size, latent_dim, hidden_size=encoder_hidden_size)
+        if model:
+            self.encoder.load_state_dict(model['encoder'])
+        self.encoder = self.encoder.to(self.device)
+        self.decoder = Decoder(self.window_size, latent_dim, hidden_size=decoder_hidden_size)
+        if model:
+            self.decoder.load_state_dict(model['decoder'])
+        self.decoder = self.decoder.to(self.device)
+        self.cx = Cx(self.window_size, state_dim=self.state_size, cnn_blocks=cx_cnn_blocks)
+        if model:
+            self.cx.load_state_dict(model['cx'])
+        self.cx = self.cx.to(self.device)
+        self.cz = Cz(latent_dim)
+        if model:
+            self.cz.load_state_dict(model['cz'])
+        self.cz = self.cz.to(self.device)
         self.optimizer_encoder = torch.optim.Adam(
             self.encoder.parameters(), lr=lr)
+        if model:
+            self.optimizer_encoder.load_state_dict(model['optimizer_encoder'])
         self.optimizer_decoder = torch.optim.Adam(
             self.decoder.parameters(), lr=lr)
+        if model:
+            self.optimizer_decoder.load_state_dict(model['optimizer_decoder'])
         self.optimizer_cx = torch.optim.Adam(self.cx.parameters(), lr=lr)
+        if model:
+            self.optimizer_cx.load_state_dict(model['optimizer_cx'])
         self.optimizer_cz = torch.optim.Adam(self.cz.parameters(), lr=lr)
+        if model:
+            self.optimizer_cz.load_state_dict(model['optimizer_cz'])
 
     @staticmethod
     def gradient_penalty(model, real, fake, device):
@@ -302,6 +333,8 @@ class TadGAN:
 
     @property
     def raw(self):
+        if self.dataset is None:
+            return []
         length = self.window_size + self.step_size * (len(self.dataset) - 1)
         ret = np.zeros((length, self.state_size))
 
@@ -312,11 +345,36 @@ class TadGAN:
                 index = int(i + start)
                 ret[index, :] = values[:, i]
 
-        self.__raw = ret
         return ret
 
+    def save(self, path='./', file_name='model.pth'):
+        torch.save(
+            {
+                'window_size': self.window_size,
+                'state_size': self.state_size,
+                'step_size': self.step_size,
+                'batch_size': self.batch_size,
+                'num_epoch': self.num_epoch,
+                'lr': self.lr,
+                'num_critics': self.num_critics,
+                'latent_dim': self.latent_dim,
+                'loss_rate_critics': self.loss_rate_critics,
+                'loss_rate_generator': self.loss_rate_generator,
+                'encoder': self.encoder.to('cpu').state_dict(),
+                'decoder': self.decoder.to('cpu').state_dict(),
+                'cx': self.cx.to('cpu').state_dict(),
+                'cz': self.cz.to('cpu').state_dict(),
+                'optimizer_encoder': self.optimizer_encoder.state_dict(),
+                'optimizer_decoder': self.optimizer_decoder.state_dict(),
+                'optimizer_cx': self.optimizer_cx.state_dict(),
+                'optimizer_cz': self.optimizer_cz.state_dict(),
+            },
+            f'{path}/{file_name}',
+        )
 
     def train(self, num_epoch=100, debug=False):
+        if self.dataset is None:
+            raise TadGanError('invalid: none dataset')
         cx_loss = []
         cz_loss = []
         g_loss = []
